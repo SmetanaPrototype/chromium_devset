@@ -64,6 +64,19 @@ fi
 
 cd "$WINE_SRC"
 
+# --- Ensure build artifacts in the source tree are owned by the current user ---
+if [ "$(id -u)" -ne 0 ]; then
+    owner_mismatch=$(find . -maxdepth 4 \
+        \( -name '*.dll' -o -name '*.so' -o -name '*.o' -o -name '*.a' \) \
+        ! -user "$(id -u)" -print -quit 2>/dev/null)
+
+    if [ -n "$owner_mismatch" ]; then
+        echo ">>> Found file not owned by $USER: $owner_mismatch" >&2
+        echo ">>> Fixing ownership of the source tree ..." >&2
+        sudo chown -Rh "$USER:$(id -gn)" .
+    fi
+fi
+
 detect_changed() {
     local dll_dir dll_name built missing
     for dll_dir in dlls/*/; do

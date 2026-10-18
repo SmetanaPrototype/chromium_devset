@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# --- Проверка аргументов ---
 if [ $# -ne 1 ]; then
     echo "Использование: $0 <путь_к_сертификату.crt>"
     exit 1
@@ -13,7 +12,6 @@ if [ ! -f "$CERT_FILE" ]; then
     exit 1
 fi
 
-# --- Информация о сертификате ---
 echo "=== Информация о сертификате ==="
 openssl x509 -in "$CERT_FILE" -noout -subject -issuer -dates 2>/dev/null
 CERT_CN=$(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^,]+')
@@ -31,7 +29,6 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# --- Обновление системного хранилища ---
 echo "Обновление системного хранилища сертификатов..."
 sudo update-ca-certificates
 

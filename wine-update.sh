@@ -1,47 +1,64 @@
 #!/usr/bin/env bash
 #
-#   ./rebuild_wine.sh                              # автоопределение изменений
-#   ./rebuild_wine.sh -s ~/wine                    # явный путь к исходникам
-#   ./rebuild_wine.sh -s ~/wine winhttp            # конкретные DLL
-#   ./rebuild_wine.sh -s ~/wine winhttp secur32    # несколько
-#   ./rebuild_wine.sh -s ~/wine -p ~/prefix winhttp
+#   ./wine-update.sh                  # auto-detect from current directory
+#   ./wine-update.sh ~/wine           # explicit source path
 
 set -euo pipefail
 
-WINE_SRC="${WINE_SRC:-$HOME/wine}"
 WINE_PREFIX="${WINEPREFIX:-$HOME/.wine}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
 
 usage() {
     cat <<'EOF'
-Usage: rebuild_wine.sh [options] [dll ...]
+Usage: wine-update.sh [wine_src]
 
-Options:
-  -s, --src PATH           путь к исходникам Wine (по умолчанию $WINE_SRC или ~/wine)
-  -p, --prefix PATH        WINEPREFIX (по умолчанию $WINEPREFIX или ~/.wine)
-  -i, --install-prefix P   INSTALL_PREFIX (по умолчанию /usr/local)
-  -h, --help               эта справка
+  wine_src   Path to the Wine source tree. If omitted, auto-detected by
+             walking up from the current directory, then $WINE_SRC,
+             then ~/wine.
 
-Без DLL-аргументов скрипт сам определяет, что изменилось.
+Environment:
+  WINEPREFIX        Wine prefix (default: ~/.wine)
+  INSTALL_PREFIX    make install prefix (default: /usr/local)
+  WINE_SRC          Fallback path to the Wine sources
 EOF
 }
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -s|--src)            WINE_SRC="$2"; shift 2 ;;
-        -p|--prefix)         WINE_PREFIX="$2"; shift 2 ;;
-        -i|--install-prefix) INSTALL_PREFIX="$2"; shift 2 ;;
-        -h|--help)           usage; exit 0 ;;
-        --)                  shift; break ;;
-        -*)                  echo "Неизвестная опция: $1" >&2; usage >&2; exit 1 ;;
-        *)                   break ;;
-    esac
-done
+detect_wine_src() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/configure" ] && [ -f "$dir/dlls/ntdll/ntdll.spec" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+if [ $# -gt 1 ]; then
+    echo "ERROR: too many arguments: $*" >&2
+    usage >&2
+    exit 1
+fi
+
+if [ $# -eq 1 ]; then
+    WINE_SRC="$1"
+elif detected=$(detect_wine_src); then
+    WINE_SRC="$detected"
+    echo ">>> Wine src: $WINE_SRC" >&2
+else
+    WINE_SRC="${WINE_SRC:-$HOME/wine}"
+fi
 
 INSTALL_LIB="$INSTALL_PREFIX/lib/wine"
 
 if [ ! -d "$WINE_SRC/dlls" ]; then
-    echo "ОШИБКА: $WINE_SRC/dlls не найден. Задайте --src или WINE_SRC." >&2
+    echo "ERROR: $WINE_SRC/dlls not found." >&2
+    echo "Run from the wine source tree or pass it as an argument." >&2
     exit 1
 fi
 
@@ -80,21 +97,17 @@ detect_changed() {
     done
 }
 
-if [ $# -gt 0 ]; then
-    changed=("$@")
-else
-    mapfile -t changed < <(detect_changed)
-fi
+mapfile -t changed < <(detect_changed)
 
 if [ ${#changed[@]} -eq 0 ]; then
-    echo "Изменений не обнаружено."
+    echo "Nothing to update."
     exit 0
 fi
 
-echo "Будут пересобраны: ${changed[*]}"
+echo "Rebuild targets: ${changed[*]}"
 echo
 
-echo ">>> Удаляю собранные DLL, чтобы форсировать сборку"
+echo ">>> Removing built DLLs to force rebuild"
 for dll in "${changed[@]}"; do
     for f in "dlls/$dll/x86_64-windows/$dll.dll" \
              "dlls/$dll/i386-windows/$dll.dll" \
@@ -115,7 +128,7 @@ echo ">>> sudo make install"
 sudo make install
 echo
 
-echo ">>> Копирую в префикс $WINE_PREFIX"
+echo ">>> Copy to prefix $WINE_PREFIX"
 for dll in "${changed[@]}"; do
     src="$INSTALL_LIB/x86_64-windows/$dll.dll"
     dst="$WINE_PREFIX/drive_c/windows/system32/$dll.dll"
@@ -131,4 +144,4 @@ for dll in "${changed[@]}"; do
 done
 echo
 
-echo "Готово."
+echo "Ready."

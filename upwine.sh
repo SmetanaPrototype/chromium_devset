@@ -132,9 +132,7 @@ done
 echo
 
 for dll in "${changed[@]}"; do
-    echo ">>> make -C dlls/$dll"
     make -C "dlls/$dll"
-    echo
 done
 
 echo ">>> sudo make install"

@@ -1,19 +1,47 @@
 #!/usr/bin/env bash
 #
-#   ./rebuild_wine.sh                  # автоопределение изменений
-#   ./rebuild_wine.sh winhttp          # конкретные DLL
-#   ./rebuild_wine.sh winhttp secur32  # несколько
-
+#   ./rebuild_wine.sh                              # автоопределение изменений
+#   ./rebuild_wine.sh -s ~/wine                    # явный путь к исходникам
+#   ./rebuild_wine.sh -s ~/wine winhttp            # конкретные DLL
+#   ./rebuild_wine.sh -s ~/wine winhttp secur32    # несколько
+#   ./rebuild_wine.sh -s ~/wine -p ~/prefix winhttp
 
 set -euo pipefail
 
 WINE_SRC="${WINE_SRC:-$HOME/wine}"
 WINE_PREFIX="${WINEPREFIX:-$HOME/.wine}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+
+usage() {
+    cat <<'EOF'
+Usage: rebuild_wine.sh [options] [dll ...]
+
+Options:
+  -s, --src PATH           путь к исходникам Wine (по умолчанию $WINE_SRC или ~/wine)
+  -p, --prefix PATH        WINEPREFIX (по умолчанию $WINEPREFIX или ~/.wine)
+  -i, --install-prefix P   INSTALL_PREFIX (по умолчанию /usr/local)
+  -h, --help               эта справка
+
+Без DLL-аргументов скрипт сам определяет, что изменилось.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s|--src)            WINE_SRC="$2"; shift 2 ;;
+        -p|--prefix)         WINE_PREFIX="$2"; shift 2 ;;
+        -i|--install-prefix) INSTALL_PREFIX="$2"; shift 2 ;;
+        -h|--help)           usage; exit 0 ;;
+        --)                  shift; break ;;
+        -*)                  echo "Неизвестная опция: $1" >&2; usage >&2; exit 1 ;;
+        *)                   break ;;
+    esac
+done
+
 INSTALL_LIB="$INSTALL_PREFIX/lib/wine"
 
 if [ ! -d "$WINE_SRC/dlls" ]; then
-    echo "ОШИБКА: $WINE_SRC/dlls не найден. Задайте WINE_SRC." >&2
+    echo "ОШИБКА: $WINE_SRC/dlls не найден. Задайте --src или WINE_SRC." >&2
     exit 1
 fi
 
@@ -37,10 +65,8 @@ detect_changed() {
             fi
         done
 
-        # если ничего не собрано вообще — тоже пересборка
         [ -z "$built" ] && missing=1
 
-        # если что-то удалено — сразу в список
         if [ "$missing" = "1" ]; then
             echo "$dll_name"
             continue

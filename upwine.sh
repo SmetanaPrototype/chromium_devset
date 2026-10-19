@@ -2,13 +2,11 @@
 #
 # wine-update.sh — incremental rebuild of changed Wine DLLs.
 #
-# Design notes:
-#   * Only touch dlls that already have a built artifact in this tree.
-#   * Use `make -q` with a timeout per dll — Wine's makefiles can make -q
-#     slow (and it returns 1 for "Makefile stale", not just "target stale").
-#   * Never rm built artifacts. Let make decide what is stale.
-#   * Keep going if one target fails; report at the end.
-#   * Ask for sudo once, up front — never surprise-prompt mid-run.
+# Optimization:
+#   Instead of calling `make -q` 600+ times sequentially (which is slow
+#   because make re-parses the Makefile tree on each call), we run
+#   `make -n` once. It prints what *would* be built, and we extract
+#   the affected dll directories from its output.
 
 set -uo pipefail
 
@@ -21,11 +19,7 @@ read -ra SKIP_DLLS <<<"${SKIP_DLLS:-wineandroid.drv}"
 usage() {
     cat <<'EOF'
 Usage: wine-update.sh [wine_src]
-
-  wine_src   Path to the Wine source tree. If omitted, auto-detected by
-             walking up from the current directory, then $WINE_SRC,
-             then ~/wine.
-
+  wine_src   Path to the Wine source tree. If omitted, auto-detected.
 Environment:
   WINEPREFIX        Wine prefix (default: ~/.wine)
   INSTALL_PREFIX    make install prefix (default: /usr/local)
@@ -45,9 +39,7 @@ detect_wine_src() {
     return 1
 }
 
-case "${1:-}" in
-    -h|--help) usage; exit 0 ;;
-esac
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 [ $# -gt 1 ] && { echo "ERROR: too many arguments: $*" >&2; usage >&2; exit 1; }
 
 if [ $# -eq 1 ]; then
@@ -59,31 +51,23 @@ else
     WINE_SRC="${WINE_SRC:-$HOME/wine}"
 fi
 
-[ -d "$WINE_SRC/dlls" ] || {
-    echo "ERROR: $WINE_SRC/dlls not found." >&2
-    echo "Run from the wine source tree or pass it as an argument." >&2
-    exit 1
-}
-
+[ -d "$WINE_SRC/dlls" ] || { echo "ERROR: $WINE_SRC/dlls not found." >&2; exit 1; }
 cd "$WINE_SRC"
 
-# --- Ask for sudo once, up front. If the user cannot sudo, fail early. ---
 if [ "$(id -u)" -ne 0 ]; then
     echo ">>> Requesting sudo (needed later for 'make install')..." >&2
     sudo -v || { echo "ERROR: sudo required" >&2; exit 1; }
 fi
 
-# --- Fast ownership check: only built artifacts, not the whole tree. ---
+# --- Ownership check (only dlls/ dir for speed) ---
 if [ "$(id -u)" -ne 0 ]; then
     echo ">>> Checking ownership of build artifacts..." >&2
-    # Target the only directories that contain build outputs.
     bad=$(find dlls -maxdepth 3 \
             \( -name '*.dll' -o -name '*.so' -o -name '*.o' -o -name '*.a' \) \
             ! -user "$(id -u)" -print -quit 2>/dev/null)
     if [ -n "$bad" ]; then
         echo ">>> Found file not owned by $USER: $bad" >&2
-        echo ">>> Fixing ownership (this may take a moment)..." >&2
-        # Limit chown to dlls/ to avoid touching .git and other huge subtrees.
+        echo ">>> Fixing ownership of dlls/ (this may take a moment)..." >&2
         sudo chown -Rh "$USER:$(id -gn)" dlls
     fi
 fi
@@ -104,34 +88,29 @@ has_built_artifact() {
     return 1
 }
 
-# How long we allow a single `make -q` to take before giving up on it.
-MAKE_Q_TIMEOUT="${MAKE_Q_TIMEOUT:-10}"
-
 detect_changed() {
-    local dll_dir dll_name rc total=0 done_=0
-    local -a dirs=()
-    for dll_dir in dlls/*/; do
-        dll_name=$(basename "$dll_dir")
-        is_skipped "$dll_name" && continue
-        has_built_artifact "$dll_dir" "$dll_name" || continue
-        dirs+=("$dll_name")
-    done
-    total=${#dirs[@]}
-    echo ">>> Scanning $total built dlls for staleness..." >&2
+    echo ">>> Scanning for changes (dry-run)..." >&2
+    
+    # Run make in dry-run mode. It parses all dependencies ONCE and
+    # prints the commands it would execute. We extract 'dlls/foo/'.
+    local changed_dlls
+    changed_dlls=$(timeout 120 make -n 2>/dev/null | \
+        grep -oE '\bdlls/[a-zA-Z0-9._-]+/' | \
+        cut -d/ -f2 | sort -u)
 
-    for dll_name in "${dirs[@]}"; do
-        done_=$((done_ + 1))
-        printf '\r>>> [%d/%d] checking dlls/%s\033[K' "$done_" "$total" "$dll_name" >&2
-        timeout "$MAKE_Q_TIMEOUT" make -q -C "dlls/$dll_name" >/dev/null 2>&1
-        rc=$?
-        case "$rc" in
-            0) : ;;                       # up to date
-            1) echo "$dll_name" ;;        # needs rebuild
-            124) : ;;                     # timeout — skip, don't hang
-            *) : ;;                       # error — skip
-        esac
+    local dll_name
+    for dll_name in $changed_dlls; do
+        # 1. Is it a real directory?
+        [ -d "dlls/$dll_name" ] || continue
+        
+        # 2. Should we skip it?
+        is_skipped "$dll_name" && continue
+        
+        # 3. Does it have a pre-existing built artifact?
+        has_built_artifact "dlls/$dll_name/" "$dll_name" || continue
+        
+        echo "$dll_name"
     done
-    echo >&2
 }
 
 mapfile -t changed < <(detect_changed)
@@ -180,5 +159,4 @@ for dll in "${changed[@]}"; do
     [ -f "$src" ] && [ -e "$dst" ] && cp -v "$src" "$dst"
 done
 echo
-
 echo "Ready."

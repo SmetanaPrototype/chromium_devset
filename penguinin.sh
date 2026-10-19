@@ -9,11 +9,11 @@ usage() {
 Usage: $(basename "$0") <address> <penguin_name> [flag] [path]
 
 Modes:
-  (no flag)     interactive shell into the penguin container
-  -c  <file>    copy a local file into the penguin user's home
-  -cr <dir>     copy a local folder into the penguin user's home
-  -e  <file>    extract a file from the penguin user's home into cwd
-  -er <dir>     extract a folder from the penguin user's home into cwd
+  (no flag)     интерактивный вход в контейнер penguin
+  -c  <file>    скопировать локальный файл в home пингвина
+  -cr <dir>     скопировать локальную папку в home пингвина
+  -e  <file>    извлечь файл из home пингвина в текущую папку
+  -er <dir>     извлечь папку из home пингвина в текущую папку
 EOF
   exit 1
 }
@@ -30,7 +30,6 @@ fi
 case "$flag" in
   "") ;;
   -c|-cr|-e|-er)
-    # Every non-interactive mode requires a source/target path.
     [[ -n "$path" ]] || { echo "Flag $flag requires a path argument" >&2; usage; }
     ;;
   *) echo "Unknown flag: $flag" >&2; usage ;;
@@ -41,24 +40,24 @@ echo
 
 SSH_BASE=(sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new)
 
-# Build the remote command:
-#   vmc start termina -- lxc exec penguin -- su -l USER -c '...'
-# Single quotes cannot appear inside the single-quoted snippet, so the
-# inner command uses only double quotes and octal escapes.
+# Безопасная передача команды через base64
 penguin_cmd() {
-  printf "vmc start termina -- lxc exec penguin -- su -l %s -c '%s'" \
-    "$penguin_name" "$1"
+  local cmd="$1"
+  local b64
+  b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
+  printf "vmc start termina -- lxc exec penguin -- su -l %s -c \"echo %s | base64 -d | sh\"" \
+    "$penguin_name" "$b64"
 }
 
 case "$flag" in
   "")
-    # --- interactive login (same as before) ---
+    # --- интерактивный вход (как раньше) ---
     { sleep 5; printf 'lxc exec penguin -- su -l %s\n' "$penguin_name"; cat; } \
       | "${SSH_BASE[@]}" -tt root@"$address" 'vmc start termina'
     ;;
 
   -c)
-    # --- file: local base64 -> remote base64 -d > target ---
+    # --- файл: локально base64 -> удалённо base64 -d > target ---
     [[ -f "$path" ]] || { echo "Not a regular file: $path" >&2; exit 1; }
     target=$(basename "$path")
     base64 "$path" \
@@ -68,7 +67,7 @@ case "$flag" in
     ;;
 
   -cr)
-    # --- folder: tar czf - | base64 -> remote base64 -d | tar xzf - ---
+    # --- папка: tar czf - | base64 -> удалённо base64 -d | tar xzf - ---
     [[ -d "$path" ]] || { echo "Not a directory: $path" >&2; exit 1; }
     target=$(basename "$path")
     tar czf - -C "$path" . \
@@ -79,7 +78,7 @@ case "$flag" in
     ;;
 
   -e)
-    # --- file from penguin -> current directory ---
+    # --- файл из пингвина -> текущая папка ---
     target=$(basename "$path")
     "${SSH_BASE[@]}" -T root@"$address" \
       "$(penguin_cmd "base64 -w 76 $path")" \
@@ -87,7 +86,7 @@ case "$flag" in
     ;;
 
   -er)
-    # --- folder from penguin -> current directory ---
+    # --- папка из пингвина -> текущая папка ---
     target=$(basename "$path")
     mkdir -p "$target"
     "${SSH_BASE[@]}" -T root@"$address" \

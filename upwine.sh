@@ -125,7 +125,6 @@ echo
 
 failures=()
 for dll in "${changed[@]}"; do
-    echo ">>> make -C dlls/$dll"
     if ! make -C "dlls/$dll"; then
         failures+=("$dll")
     fi

@@ -14,6 +14,16 @@ Modes:
   -cr <dirs>    Copy local folder(s) to penguin's home
   -e  <files>   Extract file(s) from penguin's home to cwd
   -er <dirs>    Extract folder(s) from penguin's home to cwd
+
+Paths are interpreted relative to the penguin user's home (~) on the
+remote side, and preserved locally on extraction.
+
+Examples:
+  penguinin 192.168.0.100 user04 -cr wine/dlls
+    uploads local wine/dlls into ~/wine/dlls in the penguin
+
+  penguinin 192.168.0.100 user04 -e wine/dlls/foo.dll
+    downloads ~/wine/dlls/foo.dll to ./wine/dlls/foo.dll
 EOF
   exit 1
 }
@@ -42,13 +52,27 @@ echo
 
 SSH_BASE=(sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new)
 
-# Generate the command to be executed inside the Termina VM.
 penguin_cmd() {
   local cmd="$1"
   local escaped_cmd
   escaped_cmd=$(printf '%s' "$cmd" | sed "s/'/'\\\\''/g")
   printf "lxc exec penguin -- su -l %s -c '%s'\n" \
     "$penguin_name" "$escaped_cmd"
+}
+
+# Convert a local path argument to a path relative to the penguin's home.
+#   - absolute paths -> basename (put into ~)
+#   - relative paths -> as-is (after stripping leading ./)
+penguin_rel_path() {
+  local p="$1"
+  if [[ "$p" == /* ]]; then
+    basename "$p"
+  else
+    while [[ "$p" == ./* ]]; do
+      p="${p#./}"
+    done
+    echo "$p"
+  fi
 }
 
 case "$flag" in
@@ -62,10 +86,10 @@ case "$flag" in
     # Upload multiple files
     for path in "${paths[@]}"; do
       [[ -f "$path" ]] || { echo "Not a regular file: $path" >&2; exit 1; }
-      target=$(basename "$path")
-      echo ">>> Uploading file: $path -> $target" >&2
+      rel=$(penguin_rel_path "$path")
+      echo ">>> Uploading file: $path -> ~/$rel" >&2
       {
-        penguin_cmd "base64 -d > \"$target\""
+        penguin_cmd "mkdir -p \"\$(dirname \"$rel\")\" && base64 -d > \"$rel\""
         base64 "$path"
       } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' > /dev/null
     done
@@ -75,10 +99,10 @@ case "$flag" in
     # Upload multiple folders
     for path in "${paths[@]}"; do
       [[ -d "$path" ]] || { echo "Not a directory: $path" >&2; exit 1; }
-      target=$(basename "$path")
-      echo ">>> Uploading directory: $path -> $target" >&2
+      rel=$(penguin_rel_path "$path")
+      echo ">>> Uploading directory: $path -> ~/$rel" >&2
       {
-        penguin_cmd "mkdir -p \"$target\" && base64 -d | tar xzf - -C \"$target\""
+        penguin_cmd "mkdir -p \"$rel\" && base64 -d | tar xzf - -C \"$rel\""
         tar czf - -C "$path" . | base64
       } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' > /dev/null
     done
@@ -87,8 +111,9 @@ case "$flag" in
   -e)
     # Download multiple files
     for path in "${paths[@]}"; do
-      target=$(basename "$path")
-      echo ">>> Downloading file: $path -> $target" >&2
+      target="$path"
+      echo ">>> Downloading file: ~/$path -> ./$target" >&2
+      mkdir -p "$(dirname "$target")"
       {
         penguin_cmd "echo '---BEGIN---'; base64 -w 76 \"$path\"; echo '---END---'"
         echo "exit"
@@ -101,8 +126,8 @@ case "$flag" in
   -er)
     # Download multiple folders
     for path in "${paths[@]}"; do
-      target=$(basename "$path")
-      echo ">>> Downloading directory: $path -> $target" >&2
+      target="$path"
+      echo ">>> Downloading directory: ~/$path -> ./$target" >&2
       mkdir -p "$target"
       {
         penguin_cmd "echo '---BEGIN---'; tar czf - -C \"$path\" . | base64 -w 76; echo '---END---'"

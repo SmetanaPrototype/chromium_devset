@@ -40,57 +40,67 @@ echo
 
 SSH_BASE=(sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new)
 
-# Безопасная передача команды через base64
+# Генерирует команду для выполнения внутри пингвина. 
+# Кодирует в base64, чтобы избежать проблем с кавычками.
 penguin_cmd() {
   local cmd="$1"
   local b64
   b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
-  printf "vmc start termina -- lxc exec penguin -- su -l %s -c \"echo %s | base64 -d | sh\"" \
+  printf 'lxc exec penguin -- su -l %s -c "echo %s | base64 -d | sh"' \
     "$penguin_name" "$b64"
 }
 
 case "$flag" in
   "")
-    # --- интерактивный вход (как раньше) ---
+    # Интерактивный вход (как в оригинале)
     { sleep 5; printf 'lxc exec penguin -- su -l %s\n' "$penguin_name"; cat; } \
       | "${SSH_BASE[@]}" -tt root@"$address" 'vmc start termina'
     ;;
 
   -c)
-    # --- файл: локально base64 -> удалённо base64 -d > target ---
+    # Загрузка файла: шлем команду, затем бинарные данные.
     [[ -f "$path" ]] || { echo "Not a regular file: $path" >&2; exit 1; }
     target=$(basename "$path")
-    base64 "$path" \
-      | "${SSH_BASE[@]}" -T root@"$address" \
-          "$(penguin_cmd "tr -d \"\\015\" | base64 -d > $target")" \
-        > /dev/null
+    {
+      penguin_cmd "cat > $target"
+      echo ""  # Перевод строки, чтобы терминал выполнил команду
+      base64 "$path"
+    } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' > /dev/null
     ;;
 
   -cr)
-    # --- папка: tar czf - | base64 -> удалённо base64 -d | tar xzf - ---
+    # Загрузка папки: шлем команду, затем tar+base64.
     [[ -d "$path" ]] || { echo "Not a directory: $path" >&2; exit 1; }
     target=$(basename "$path")
-    tar czf - -C "$path" . \
-      | base64 \
-      | "${SSH_BASE[@]}" -T root@"$address" \
-          "$(penguin_cmd "mkdir -p $target && tr -d \"\\015\" | base64 -d | tar xzf - -C $target")" \
-        > /dev/null
+    {
+      penguin_cmd "mkdir -p $target && tar xzf - -C $target"
+      echo ""
+      tar czf - -C "$path" . | base64
+    } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' > /dev/null
     ;;
 
   -e)
-    # --- файл из пингвина -> текущая папка ---
+    # Скачивание файла: используем маркеры, чтобы отсечь приветствие терминала.
     target=$(basename "$path")
-    "${SSH_BASE[@]}" -T root@"$address" \
-      "$(penguin_cmd "base64 -w 76 $path")" \
-      | tr -d '\r' | base64 -d > "$target"
+    {
+      penguin_cmd "echo '---BEGIN---'; base64 -w 76 $path; echo '---END---'"
+      echo ""
+      echo "exit"  # Закрываем сессию после выполнения
+    } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' | \
+      sed -n '/---BEGIN---/,/---END---/p' | \
+      sed '1d;$d' | tr -d '\r' | base64 -d > "$target"
     ;;
 
   -er)
-    # --- папка из пингвина -> текущая папка ---
+    # Скачивание папки: используем маркеры.
     target=$(basename "$path")
     mkdir -p "$target"
-    "${SSH_BASE[@]}" -T root@"$address" \
-      "$(penguin_cmd "tar czf - -C $path . | base64 -w 76")" \
-      | tr -d '\r' | base64 -d | tar xzf - -C "$target"
+    {
+      penguin_cmd "echo '---BEGIN---'; tar czf - -C $path . | base64 -w 76; echo '---END---'"
+      echo ""
+      echo "exit"
+    } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' | \
+      sed -n '/---BEGIN---/,/---END---/p' | \
+      sed '1d;$d' | tr -d '\r' | base64 -d | tar xzf - -C "$target"
     ;;
 esac

@@ -2,26 +2,20 @@
 #
 # wine-update.sh — incremental rebuild of changed Wine DLLs.
 #
-# Strategy:
-#   * Only consider dlls that already have at least one built artifact
-#     (windows .dll / windows .drv / unix .so). If none, skip — this tree
-#     never built it, so don't start now.
-#   * Ask `make -q` whether the dll subdir is up to date.
-#       0 = up to date    -> skip
-#       1 = needs rebuild -> include
-#       >1 = error        -> skip (e.g. missing optional toolchain)
-#   * Never rm built artifacts. Let make decide what's stale.
+# Design notes:
+#   * Only touch dlls that already have a built artifact in this tree.
+#   * Use `make -q` with a timeout per dll — Wine's makefiles can make -q
+#     slow (and it returns 1 for "Makefile stale", not just "target stale").
+#   * Never rm built artifacts. Let make decide what is stale.
 #   * Keep going if one target fails; report at the end.
+#   * Ask for sudo once, up front — never surprise-prompt mid-run.
 
-set -uo pipefail   # NOTE: no -e here — one dll failing must not abort everything
+set -uo pipefail
 
 WINE_PREFIX="${WINEPREFIX:-$HOME/.wine}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
 INSTALL_LIB="$INSTALL_PREFIX/lib/wine"
 
-# Targets that need optional toolchains (Android SDK/gradle, etc.)
-# and should be skipped unless explicitly requested.
-# Override via env: SKIP_DLLS="wineandroid.drv winefoo.drv"
 read -ra SKIP_DLLS <<<"${SKIP_DLLS:-wineandroid.drv}"
 
 usage() {
@@ -44,8 +38,7 @@ detect_wine_src() {
     local dir="$PWD"
     while [ "$dir" != "/" ]; do
         if [ -f "$dir/configure" ] && [ -f "$dir/dlls/ntdll/ntdll.spec" ]; then
-            echo "$dir"
-            return 0
+            echo "$dir"; return 0
         fi
         dir=$(dirname "$dir")
     done
@@ -55,12 +48,7 @@ detect_wine_src() {
 case "${1:-}" in
     -h|--help) usage; exit 0 ;;
 esac
-
-if [ $# -gt 1 ]; then
-    echo "ERROR: too many arguments: $*" >&2
-    usage >&2
-    exit 1
-fi
+[ $# -gt 1 ] && { echo "ERROR: too many arguments: $*" >&2; usage >&2; exit 1; }
 
 if [ $# -eq 1 ]; then
     WINE_SRC="$1"
@@ -71,36 +59,41 @@ else
     WINE_SRC="${WINE_SRC:-$HOME/wine}"
 fi
 
-if [ ! -d "$WINE_SRC/dlls" ]; then
+[ -d "$WINE_SRC/dlls" ] || {
     echo "ERROR: $WINE_SRC/dlls not found." >&2
     echo "Run from the wine source tree or pass it as an argument." >&2
     exit 1
-fi
+}
 
 cd "$WINE_SRC"
 
-# --- Fix ownership of build artifacts if needed (unchanged) ---
+# --- Ask for sudo once, up front. If the user cannot sudo, fail early. ---
 if [ "$(id -u)" -ne 0 ]; then
-    owner_mismatch=$(find . -maxdepth 4 \
-        \( -name '*.dll' -o -name '*.so' -o -name '*.o' -o -name '*.a' \) \
-        ! -user "$(id -u)" -print -quit 2>/dev/null)
-    if [ -n "$owner_mismatch" ]; then
-        echo ">>> Found file not owned by $USER: $owner_mismatch" >&2
-        echo ">>> Fixing ownership of the source tree ..." >&2
-        sudo chown -Rh "$USER:$(id -gn)" .
+    echo ">>> Requesting sudo (needed later for 'make install')..." >&2
+    sudo -v || { echo "ERROR: sudo required" >&2; exit 1; }
+fi
+
+# --- Fast ownership check: only built artifacts, not the whole tree. ---
+if [ "$(id -u)" -ne 0 ]; then
+    echo ">>> Checking ownership of build artifacts..." >&2
+    # Target the only directories that contain build outputs.
+    bad=$(find dlls -maxdepth 3 \
+            \( -name '*.dll' -o -name '*.so' -o -name '*.o' -o -name '*.a' \) \
+            ! -user "$(id -u)" -print -quit 2>/dev/null)
+    if [ -n "$bad" ]; then
+        echo ">>> Found file not owned by $USER: $bad" >&2
+        echo ">>> Fixing ownership (this may take a moment)..." >&2
+        # Limit chown to dlls/ to avoid touching .git and other huge subtrees.
+        sudo chown -Rh "$USER:$(id -gn)" dlls
     fi
 fi
 
 is_skipped() {
     local name="$1" s
-    for s in "${SKIP_DLLS[@]}"; do
-        [ "$s" = "$name" ] && return 0
-    done
+    for s in "${SKIP_DLLS[@]}"; do [ "$s" = "$name" ] && return 0; done
     return 1
 }
 
-# Return 0 if this dll has at least one built artifact in this tree.
-# Covers windows .dll, windows .drv, and unix .so (top-level).
 has_built_artifact() {
     local dir="$1" name="$2"
     [ -f "$dir/x86_64-windows/$name.dll" ] && return 0
@@ -111,22 +104,34 @@ has_built_artifact() {
     return 1
 }
 
+# How long we allow a single `make -q` to take before giving up on it.
+MAKE_Q_TIMEOUT="${MAKE_Q_TIMEOUT:-10}"
+
 detect_changed() {
-    local dll_dir dll_name rc
+    local dll_dir dll_name rc total=0 done_=0
+    local -a dirs=()
     for dll_dir in dlls/*/; do
         dll_name=$(basename "$dll_dir")
-
         is_skipped "$dll_name" && continue
         has_built_artifact "$dll_dir" "$dll_name" || continue
+        dirs+=("$dll_name")
+    done
+    total=${#dirs[@]}
+    echo ">>> Scanning $total built dlls for staleness..." >&2
 
-        make -q -C "dlls/$dll_name" >/dev/null 2>&1
+    for dll_name in "${dirs[@]}"; do
+        done_=$((done_ + 1))
+        printf '\r>>> [%d/%d] checking dlls/%s\033[K' "$done_" "$total" "$dll_name" >&2
+        timeout "$MAKE_Q_TIMEOUT" make -q -C "dlls/$dll_name" >/dev/null 2>&1
         rc=$?
         case "$rc" in
-            1) echo "$dll_name" ;;
             0) : ;;                       # up to date
-            *) : ;;                       # error/unknown -> skip silently
+            1) echo "$dll_name" ;;        # needs rebuild
+            124) : ;;                     # timeout — skip, don't hang
+            *) : ;;                       # error — skip
         esac
     done
+    echo >&2
 }
 
 mapfile -t changed < <(detect_changed)
@@ -139,10 +144,9 @@ fi
 echo "Rebuild targets: ${changed[*]}"
 echo
 
-# Rebuild changed dlls one by one. Do NOT stop on first failure —
-# collect failures and keep going, otherwise the tree ends up half-built.
 failures=()
 for dll in "${changed[@]}"; do
+    echo ">>> make -C dlls/$dll"
     if ! make -C "dlls/$dll"; then
         failures+=("$dll")
     fi
@@ -161,24 +165,19 @@ echo
 
 echo ">>> Copy to prefix $WINE_PREFIX"
 for dll in "${changed[@]}"; do
-    # Skip dlls that failed to build
     skip=0
-    for f in "${failures[@]}"; do
+    for f in "${failures[@]:-}"; do
         [ "$f" = "$dll" ] && skip=1 && break
     done
     [ "$skip" = 1 ] && continue
 
     src="$INSTALL_LIB/x86_64-windows/$dll.dll"
     dst="$WINE_PREFIX/drive_c/windows/system32/$dll.dll"
-    if [ -f "$src" ] && [ -e "$dst" ]; then
-        cp -v "$src" "$dst"
-    fi
+    [ -f "$src" ] && [ -e "$dst" ] && cp -v "$src" "$dst"
 
     src="$INSTALL_LIB/i386-windows/$dll.dll"
     dst="$WINE_PREFIX/drive_c/windows/syswow64/$dll.dll"
-    if [ -f "$src" ] && [ -e "$dst" ]; then
-        cp -v "$src" "$dst"
-    fi
+    [ -f "$src" ] && [ -e "$dst" ] && cp -v "$src" "$dst"
 done
 echo
 

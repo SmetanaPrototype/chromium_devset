@@ -9,11 +9,11 @@ usage() {
 Usage: $(basename "$0") <address> <penguin_name> [flag] [path]
 
 Modes:
-  (no flag)     интерактивный вход в контейнер penguin
-  -c  <file>    скопировать локальный файл в home пингвина
-  -cr <dir>     скопировать локальную папку в home пингвина
-  -e  <file>    извлечь файл из home пингвина в текущую папку
-  -er <dir>     извлечь папку из home пингвина в текущую папку
+  (no flag)     Interactive shell into the penguin container
+  -c  <file>    Copy a local file to penguin's home
+  -cr <dir>     Copy a local folder to penguin's home
+  -e  <file>    Extract a file from penguin's home to cwd
+  -er <dir>     Extract a folder from penguin's home to cwd
 EOF
   exit 1
 }
@@ -25,6 +25,10 @@ path=""
 if [[ $# -ge 3 && "$3" == -* ]]; then
   flag="$3"
   path="$4"
+  if [[ $# -ne 4 ]]; then
+    echo "Error: flag $flag accepts exactly one path argument." >&2
+    usage
+  fi
 fi
 
 case "$flag" in
@@ -40,64 +44,60 @@ echo
 
 SSH_BASE=(sshpass -p "$password" ssh -o StrictHostKeyChecking=accept-new)
 
-# Генерирует команду для выполнения внутри пингвина. 
-# Кодирует в base64, чтобы избежать проблем с кавычками.
+# Generate the command to be executed inside the Termina VM.
 penguin_cmd() {
   local cmd="$1"
-  local b64
-  b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
-  printf 'lxc exec penguin -- su -l %s -c "echo %s | base64 -d | sh"' \
-    "$penguin_name" "$b64"
+  local escaped_cmd
+  # Escape single quotes so we can safely wrap the command in single quotes
+  escaped_cmd=$(printf '%s' "$cmd" | sed "s/'/'\\\\''/g")
+  printf "lxc exec penguin -- su -l %s -c '%s'\n" \
+    "$penguin_name" "$escaped_cmd"
 }
 
 case "$flag" in
   "")
-    # Интерактивный вход (как в оригинале)
+    # Interactive session
     { sleep 5; printf 'lxc exec penguin -- su -l %s\n' "$penguin_name"; cat; } \
       | "${SSH_BASE[@]}" -tt root@"$address" 'vmc start termina'
     ;;
 
   -c)
-    # Загрузка файла: шлем команду, затем бинарные данные.
+    # Upload file: send command, then the base64 data
     [[ -f "$path" ]] || { echo "Not a regular file: $path" >&2; exit 1; }
     target=$(basename "$path")
     {
-      penguin_cmd "cat > $target"
-      echo ""  # Перевод строки, чтобы терминал выполнил команду
+      penguin_cmd "base64 -d > \"$target\""
       base64 "$path"
     } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' > /dev/null
     ;;
 
   -cr)
-    # Загрузка папки: шлем команду, затем tar+base64.
+    # Upload folder: send command, then the tar+base64 data
     [[ -d "$path" ]] || { echo "Not a directory: $path" >&2; exit 1; }
     target=$(basename "$path")
     {
-      penguin_cmd "mkdir -p $target && tar xzf - -C $target"
-      echo ""
+      penguin_cmd "mkdir -p \"$target\" && base64 -d | tar xzf - -C \"$target\""
       tar czf - -C "$path" . | base64
     } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' > /dev/null
     ;;
 
   -e)
-    # Скачивание файла: используем маркеры, чтобы отсечь приветствие терминала.
+    # Download file: use markers to isolate data from shell prompts
     target=$(basename "$path")
     {
-      penguin_cmd "echo '---BEGIN---'; base64 -w 76 $path; echo '---END---'"
-      echo ""
-      echo "exit"  # Закрываем сессию после выполнения
+      penguin_cmd "echo '---BEGIN---'; base64 -w 76 \"$path\"; echo '---END---'"
+      echo "exit"
     } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' | \
       sed -n '/---BEGIN---/,/---END---/p' | \
       sed '1d;$d' | tr -d '\r' | base64 -d > "$target"
     ;;
 
   -er)
-    # Скачивание папки: используем маркеры.
+    # Download folder: use markers
     target=$(basename "$path")
     mkdir -p "$target"
     {
-      penguin_cmd "echo '---BEGIN---'; tar czf - -C $path . | base64 -w 76; echo '---END---'"
-      echo ""
+      penguin_cmd "echo '---BEGIN---'; tar czf - -C \"$path\" . | base64 -w 76; echo '---END---'"
       echo "exit"
     } | "${SSH_BASE[@]}" -T root@"$address" 'vmc start termina' | \
       sed -n '/---BEGIN---/,/---END---/p' | \
